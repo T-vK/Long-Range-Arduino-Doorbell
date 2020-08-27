@@ -4,7 +4,7 @@ The goal of this project was to create a cheap, very reliable and efficient long
 
 - Price: < $10
 - Range: Up to 1000 meters
-- Power consumption (Idle): < 1µA @ 3V
+- Power consumption (Idle): < 1µA @ 3V (I need to get a better multimeter to properly verify this.)
 
 ## Features
 
@@ -44,9 +44,37 @@ The goal of this project was to create a cheap, very reliable and efficient long
 
 Coming soon...
 
-## How to use
+## How assemble
 
-Coming soon...
+(It is highly recommended to desolder the LED and voltage regulator from the Arduino Pro Mini for minimal power consumption <1µA.)
+
+Connection between D-SUN CC1101 modules and Arduinos:
+
+```
+GDO0 -> 6
+MISO -> 12
+MOSI -> 11
+GND -> GND
+CSN -> 10
+SCK -> 13
+VCC -> 3v
+```
+
+Connection between DF-Player and Arduino Uno (or whatever you decided on using):
+
+```
+VCC -> VCC
+GND -> GND
+TX -> 9
+RX -> 8
+```
+
+Connection between button and Arduino Pro Mini:
+
+```
+Pin A -> 2
+Pin B -> GND
+```
 
 ## Credits
 
