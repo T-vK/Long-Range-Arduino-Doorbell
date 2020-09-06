@@ -1,4 +1,4 @@
-#define DEBUG true    // Uncomment to get some basic Serial output
+//#define DEBUG true    // Uncomment to get some basic Serial output
 //#define DEBUG verbose // Uncomment to get more advanced Serial output
 
 #if DEBUG == verbose
@@ -7,7 +7,10 @@
 
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 #include <SoftwareSerial.h>
+#include <EEPROM.h>
 #include <DFPlayerMini_Fast.h>
+#include <AceButton.h>
+using namespace ace_button;
 
 typedef union { // makes converting the voltage bytes back into an int easier
   int asInt;
@@ -15,7 +18,7 @@ typedef union { // makes converting the voltage bytes back into an int easier
 } voltage;
 
 // CONSTANTS (Change to your liking)
-const int DOORBELL_SOUND_CHANGE_BUTTON_PIN = 9;
+const int DOORBELL_RINGTONE_CHANGE_BUTTON_PIN = 9;
 const int DF_PLAYER_RX_PIN = 8;
 const int DF_PLAYER_TX_PIN = 9;
 #ifdef ESP32
@@ -26,20 +29,29 @@ const int DF_PLAYER_TX_PIN = 9;
   const int GDO0 = 6; // for Arduino! GDO0 on pin 6.
 #endif
 const byte DOORBELL_ID[8] = {127, 33, 45, 91, 27, 60, 8, 16};
+const int MIN_TIME_BETWEEN_RINGS = 1000; // milliseconds
 
 // CONSTANTS (Do not touch)
 const byte TRANSMITTER_ID = 1;
 const byte RECEIVER_ID = 2;
+const int RINGTONE_SETTING_ADDRESS = 0x0;
 
 // Other variables that change during runtime (Do not touch)
-int currentDoorbellSound = 1;
+static unsigned long lastPlayTime = 0;
 byte lastTransmitterRetryCount = 255;
-bool ringDoorbell = false;
-bool transmitResponse = false;
+bool shouldRingDoorbell = false;
+bool shouldTransmitResponse = false;
 voltage batteryVoltage;
+byte currentDoorbellRingtone;
+int volume = 30; // 0-30 (30 = 100%)
+int totalTrackCount;
 
+// Instantiate some classes
 SoftwareSerial mp3PlayerSerial(DF_PLAYER_TX_PIN, DF_PLAYER_RX_PIN);
 DFPlayerMini_Fast mp3Player;
+
+AceButton changeRingtoneButton(DOORBELL_RINGTONE_CHANGE_BUTTON_PIN);
+void handleChangeRingtoneButtonEvent(AceButton*, uint8_t, uint8_t);
 
 void setup() {
   #if defined(DEBUG)
@@ -48,10 +60,27 @@ void setup() {
   #endif
   
   #if defined(DEBUG)
-    Serial.println("Setting Up Internal LED");
+    Serial.println("Setting Up Internal LED...");
   #endif
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
+
+  #if defined(DEBUG)
+    Serial.println("Setting up button...");
+  #endif
+  pinMode(DOORBELL_RINGTONE_CHANGE_BUTTON_PIN, INPUT_PULLUP);
+
+  ButtonConfig* changeRingtoneButtonConfig = changeRingtoneButton.getButtonConfig();
+  changeRingtoneButtonConfig->setEventHandler(handleChangeRingtoneButtonEvent);
+  changeRingtoneButtonConfig->setFeature(ButtonConfig::kFeatureClick);
+  
+
+  #if defined(DEBUG)
+    Serial.println("Loading settings...");
+  #endif
+  currentDoorbellRingtone = EEPROM.read(RINGTONE_SETTING_ADDRESS);
+  if (currentDoorbellRingtone < 1 || currentDoorbellRingtone > 254)
+      currentDoorbellRingtone = 1;
 
   #if defined(DEBUG)
     Serial.println("Initializing CC1101 Library...");
@@ -71,10 +100,13 @@ void setup() {
   #endif
   mp3PlayerSerial.begin(9600);
   mp3Player.begin(mp3PlayerSerial);
+  totalTrackCount = mp3Player.numSdTracks();
   #if defined(DEBUG)
-    Serial.println("Setting volume to max");
+    Serial.print("Setting volume to ");
+    Serial.print((float)volume/30.0*100.0);
+    Serial.println("%...");
   #endif
-  mp3Player.volume(30);
+  mp3Player.volume(volume);
   delay(20);
 
   #if defined(DEBUG)
@@ -88,19 +120,38 @@ void loop() {
     cc1101_debug.debug();
   #endif
   
+  unsigned long now = millis();
+  
   awaitDoorbellTransmitterSignal();
   
-  if (transmitResponse) {
+  if (shouldTransmitResponse) {
     sendResponse();
   }
     
-  if (ringDoorbell) {
-    ring();
-    ringDoorbell = false;
+  if (shouldRingDoorbell) {
+    if (now > lastPlayTime+MIN_TIME_BETWEEN_RINGS) {
+        ringDoorbell();
+        lastPlayTime = now;
+    }
+    shouldRingDoorbell = false;
   }
+
+  changeRingtoneButton.check();
 }
 
-void ring() {
+void handleChangeRingtoneButtonEvent(AceButton* /* button */, uint8_t eventType, uint8_t buttonState) {
+  currentDoorbellRingtone++;
+  if (currentDoorbellRingtone >= totalTrackCount)
+    currentDoorbellRingtone = 0;
+  #if defined(DEBUG)
+    Serial.print("Ringtone changed to file #");
+    Serial.println(currentDoorbellRingtone);
+    Serial.println("Writing ringtone setting to EEPROM...");
+  #endif
+  EEPROM.update(RINGTONE_SETTING_ADDRESS, currentDoorbellRingtone);
+}
+
+void ringDoorbell() {
   #if defined(DEBUG)
     Serial.println("Doorbell Signal Received!");
     float cellVoltage = millivoltToVolt(batteryVoltage.asInt/2);
@@ -116,8 +167,11 @@ void ring() {
     #endif
   #endif
   digitalWrite(LED_BUILTIN, HIGH);
-  Serial.println("Playing MP3 file...");
-  mp3Player.play(currentDoorbellSound);
+  #if defined(DEBUG)
+    Serial.print("Playing MP3 file #");
+    Serial.println(currentDoorbellRingtone);
+  #endif
+  mp3Player.play(currentDoorbellRingtone);
   digitalWrite(LED_BUILTIN, LOW);
 }
 
@@ -145,7 +199,7 @@ void sendResponse() {
   #endif
   
   ELECHOUSE_cc1101.SetRx();
-  transmitResponse = false;
+  shouldTransmitResponse = false;
   lastTransmitterRetryCount = 255;
 }
 
@@ -180,9 +234,9 @@ void awaitDoorbellTransmitterSignal() {
       
       if (buffer[9] <= lastTransmitterRetryCount) {
         lastTransmitterRetryCount = buffer[9];
-        ringDoorbell = true;
+        shouldRingDoorbell = true;
       }
-      transmitResponse = true;
+      shouldTransmitResponse = true;
     }
   }
 }

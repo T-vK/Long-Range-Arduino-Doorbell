@@ -1,4 +1,4 @@
-#define DEBUG true    // Uncomment to get some basic Serial output
+//#define DEBUG true    // Uncomment to get some basic Serial output
 //#define DEBUG verbose // Uncomment to get more advanced Serial output
 
 #if DEBUG == verbose
@@ -7,15 +7,15 @@
 
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 #include <avr/sleep.h>
-#include <avr/power.h>
+#include <avr/wdt.h>
 
 typedef union { // makes converting the voltage int into 2 bytes easier
   int asInt;
   byte asBytes[2];
 } voltage;
 
+// CONSTANTS (Change to your liking)
 const int WAKE_BUTTON_PIN = 2; // interrupt pin to wake the Arduino out of deep sleep
-
 #ifdef ESP32
   const int GDO0 = 2; // for esp32! GDO0 on GPIO pin 2.
 #elif ESP8266
@@ -23,30 +23,45 @@ const int WAKE_BUTTON_PIN = 2; // interrupt pin to wake the Arduino out of deep 
 #else
   const int GDO0 = 6; // for Arduino! GDO0 on pin 6.
 #endif
-
-static int interruptPin = 0;
-
 const byte DOORBELL_ID[8] = {127, 33, 45, 91, 27, 60, 8, 16};
+
+int DELAY_BETWEEN_RETRIES = 500; // milliseconds
+int MAX_RETRIES = 3;
+
+// CONSTANTS (Do not touch)
 const byte TRANSMITTER_ID = 1;
 const byte RECEIVER_ID = 2;
 byte currentRetryCount = 0;
 
-voltage batteryVoltage;
-bool goToSleep = true;
+// Other variables that change during runtime (Do not touch)
+static int interruptPin;
 
-int delayBetweenRetries = 1000; // milliseconds
-int maxRetries = 10;
-static unsigned long lastTxTime;
+byte adcsraSave; // to save the ADCSRA value
+voltage batteryVoltage;
+static unsigned long lastTxTime = 0;
+bool shouldGoToSleep = true;
 
 #if defined(DEBUG)
-  static unsigned long lastWakeupTime;
+  static unsigned long lastWakeupTime = 0;
 #endif
   
 void setup() {
+  
   #if defined(DEBUG)
     Serial.begin(9600);
     Serial.println("Doorbell Transmitter");
   #endif
+
+  #if defined(DEBUG)
+    Serial.println("Setting up power saving settings...");
+  #endif
+  for (int pin = 0; pin < 20; pin++) { // all pins to output - power saving
+    pinMode(pin,OUTPUT);
+    digitalWrite(pin,LOW);
+  }
+  wdt_disable(); // disable WDT for power saving
+  EIFR = 3; // clear external interrupt flag register
+  //ADCSRA = 0; // disable ADC for power saving
 
   #if defined(DEBUG)
     Serial.println("Setting Up Interrupt Pin...");
@@ -58,8 +73,8 @@ void setup() {
   #if defined(DEBUG)
     Serial.println("Initializing CC1101 Library...");
   #endif
-  ELECHOUSE_cc1101.Init(); // must be set to initialize the cc1101!
   ELECHOUSE_cc1101.setGDO(GDO0, 0); // set lib internal gdo pins (GDO0,GDO2). GDO2 not used for this example.
+  ELECHOUSE_cc1101.Init(); // must be set to initialize the cc1101!
   ELECHOUSE_cc1101.setCCMode(1); // set config for internal transmission mode.
   ELECHOUSE_cc1101.setModulation(0); // set modulation mode. 0 = 2-FSK, 1 = GFSK, 2 = ASK/OOK, 3 = 4-FSK, 4 = MSK.
   ELECHOUSE_cc1101.setMHZ(433.92); // Here you can set your basic frequency. The lib calculates the frequency automatically (default = 433.92).The cc1101 can: 300-348 MHZ, 387-464MHZ and 779-928MHZ. Read More info from datasheet.
@@ -70,6 +85,7 @@ void setup() {
   #if defined(DEBUG)
     Serial.println("Doorbell Transmitter Is Ready!");
   #endif
+  delay(100);
 }
 
 void loop() {
@@ -77,72 +93,75 @@ void loop() {
     cc1101_debug.debug();
   #endif
   
-  if (goToSleep) {
-      enterSleep();
+  if (shouldGoToSleep) {
+    enterSleep();
+    shouldGoToSleep = false;
+    currentRetryCount = 0;
+    batteryVoltage.asInt = getVoltage();
+    #if DEBUG == verbose
+      Serial.print("Battery voltage: ");
+      Serial.print(batteryVoltage.asInt);
+      Serial.println("mV");
+    #endif
   }
   
-  //if (digitalRead(WAKE_BUTTON_PIN) == LOW) {
-  //  currentRetryCount = 0;
-  //}
-  
-  if (!goToSleep) {
-      batteryVoltage.asInt = getVoltage();
-      transmit_data();
-      receive_data();
-      if (currentRetryCount > maxRetries) {
+  if (!shouldGoToSleep) {
+      unsigned long now = millis();
+      if (currentRetryCount == 0 || now - lastTxTime > DELAY_BETWEEN_RETRIES) {
+        sendDoorbellSignal();
+        lastTxTime = now;
+        
+        #if defined(DEBUG)
+          Serial.println("Waiting For A Response...");
+        #endif
+      }
+      
+      awaitDoorbellReceiverResponse();
+      if (currentRetryCount > MAX_RETRIES) {
         #if defined(DEBUG)
           Serial.println("Failed To Get A Response From The Doorbell Reveicer!");
         #endif
-        goToSleep = true;
+        shouldGoToSleep = true;
       }
   }
-
-  //#if defined(DEBUG)
-  //  Serial.println("Test I am wake"); // Test for Sleepmode work!
-  //#endif
 }
-//////////////////////////////////////////////////////////
-void transmit_data() {
-  unsigned long now = millis();
-  if (currentRetryCount == 0 || now - lastTxTime > delayBetweenRetries) {
-    byte Packet[12];
 
-    for (int i = 0; i < 8; i++) {
-      Packet[i] = DOORBELL_ID[i];
+void sendDoorbellSignal() {
+  byte packet[12];
+
+  for (int i = 0; i < 8; i++) {
+    packet[i] = DOORBELL_ID[i];
+  }
+  packet[8] = TRANSMITTER_ID;
+  packet[9] = currentRetryCount;
+  packet[10] = batteryVoltage.asBytes[0];
+  packet[11] = batteryVoltage.asBytes[1];
+
+  currentRetryCount++;
+
+  #if defined(DEBUG)
+    Serial.println("Sending Doorbell Signal...");
+  #endif
+  
+  ELECHOUSE_cc1101.SendData(packet, 12);
+  
+  #if defined(DEBUG)
+    Serial.println("Sent Doorbell Signal!");
+  #endif
+  
+  #if DEBUG == verbose
+    Serial.print("Transmit data ");
+    for (int i = 0; i < 12; i++) {
+      Serial.print(packet[i], DEC);
+      Serial.print(",");
     }
-    Packet[8] = TRANSMITTER_ID;
-    Packet[9] = currentRetryCount;
-    Packet[10] = batteryVoltage.asBytes[0];
-    Packet[11] = batteryVoltage.asBytes[1];
+    Serial.println();
+  #endif
 
-    currentRetryCount++;
-
-    #if defined(DEBUG)
-      Serial.println("Sending Doorbell Signal...");
-    #endif
-    
-    ELECHOUSE_cc1101.SendData(Packet, 12);
-    
-    #if DEBUG == verbose
-      Serial.print("Transmit data ");
-      for (int i = 0; i < 12; i++) {
-        Serial.print(Packet[i], DEC);
-        Serial.print(",");
-      }
-      Serial.println();
-    #endif
-    
-    ELECHOUSE_cc1101.SetRx();
-    
-    #if defined(DEBUG)
-      Serial.println("Waiting For A Response...");
-    #endif
-    
-    lastTxTime = now;
-  }
+  ELECHOUSE_cc1101.SetRx();
 }
-//////////////////////////////////////////////////////////
-void receive_data() {
+
+void awaitDoorbellReceiverResponse() {
   if (ELECHOUSE_cc1101.CheckRxFifo(50)) {
     if (ELECHOUSE_cc1101.CheckCRC()) {
 
@@ -172,7 +191,7 @@ void receive_data() {
         Serial.println("Successfully Received A Response!");
       #endif
       
-      goToSleep = true;
+      shouldGoToSleep = true;
     }
   }
 }
@@ -186,17 +205,17 @@ int getVoltage(void) {
     const long InternalReferenceVoltage = 1056L;
     ADMUX = (0<<REFS1) | (1<<REFS0) | (0<<ADLAR) | (1<<MUX3) | (1<<MUX2) | (1<<MUX1) | (0<<MUX0);
   #endif
-  delay(50); // Let mux settle a little to get a more stable A/D conversion
+  //delay(50); // Let mux settle a little to get a more stable A/D conversion
   ADCSRA |= _BV( ADSC ); // Start a conversion 
   while( ( (ADCSRA & (1<<ADSC)) != 0 ) ); // Wait for it to complete
   int results = (((InternalReferenceVoltage * 1024L) / ADC) + 5L) / 10L; // Scale the value; calculates for straight line value
-  return results*10; // convert from centivolt to volt
+  return results*10; // convert from centivolts to millivolts
 }
 
 void onWakeUp() {
-  currentRetryCount = 0;
-  goToSleep = false;
-  //detachInterrupt(interruptPin);// arduino freezes. but works fine without a detach!
+  // detachInterrupt causes the Arduino wake up twice. no clue why
+  // detachInterrupt(interruptPin); //eliminates switch bouncing issues
+  sleep_disable();
 }
 
 void enterSleep() {
@@ -204,38 +223,36 @@ void enterSleep() {
     Serial.println("Entering Sleep Mode...");
   #endif
 
-  ELECHOUSE_cc1101.SpiStrobe(0x36);//Exit RX / TX, turn off frequency synthesizer and exit
-  ELECHOUSE_cc1101.SpiStrobe(0x39);//Enter power down mode when CSn goes high.
-  pinMode(GDO0,OUTPUT);
+  // Save ADCSRA value
+  adcsraSave = ADCSRA;
+  ADCSRA = 0; // disable ADC
 
-  attachInterrupt(interruptPin, onWakeUp, CHANGE);
+  // Put CC1101 module to sleep
+  ELECHOUSE_cc1101.SpiStrobe(0x36); // Exit RX / TX, turn off frequency synthesizer and exit
+  ELECHOUSE_cc1101.SpiStrobe(0x39); // Enter power down mode when CSn goes high.
 
   #if defined(DEBUG)
     Serial.print("I was awake for ");
     Serial.print(millis()-lastWakeupTime);
-    Serial.println("ms");
+    Serial.println("ms!");
+    delay(100);
   #endif
   Serial.println();
-  
-  delay(100);
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
 
+  set_sleep_mode (SLEEP_MODE_PWR_DOWN); // Deep sleep
   sleep_enable();
-  sleep_mode();
-
-  sleep_disable();
+  attachInterrupt(interruptPin, onWakeUp, FALLING);
+  sleep_bod_disable(); // disable brownout detector during sleep
+  sleep_cpu(); // now go to sleep
 
   #if defined(DEBUG)
     lastWakeupTime = millis();
   #endif
-  
-  pinMode(GDO0,INPUT);
+
+  ADCSRA = adcsraSave;
 
   #if defined(DEBUG)
     Serial.println("Woke Up From Sleep!");
-  #endif
-
-  #if defined(DEBUG)
     Serial.println("Doorbell Button Has Been Pressed!");
   #endif
 }
